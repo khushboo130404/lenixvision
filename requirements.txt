@@ -1,0 +1,9 @@
+Flask
+ultralytics
+opencv-python
+requests
+google-generativeai
+numpy
+speechrecognition
+pyaudio
+pyttsx3
