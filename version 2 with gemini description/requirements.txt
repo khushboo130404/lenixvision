@@ -1,6 +1,0 @@
-Flask
-ultralytics
-opencv-python
-requests
-google-generativeai
-numpy
