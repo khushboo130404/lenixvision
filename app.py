@@ -5,9 +5,12 @@ import requests
 import time
 from ultralytics import YOLO
 import google.generativeai as genai
-import speech_recognition as sr
-import threading
-import pyttsx3
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+from gtts import gTTS
+import pygame
+import os
+import uuid
 
 # ================= CONFIGURATION =================
 app = Flask(__name__)
@@ -22,7 +25,7 @@ STATE = {
 model = YOLO("yolov8n.pt")
 
 # Gemini Vision API
-GEMINI_API_KEY = "AIzaSyCnXazKr97QhOoBgGSKCDHfq7RtgXiSXak"  # User provided API key
+GEMINI_API_KEY = "AIzaSyCnXazKr97QhOoBgGSKCDHfq7RtgXiSXak"  # Replace with your valid key
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -30,68 +33,20 @@ gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 LAST_LABEL_FILE = "last_labels.txt"
 open(LAST_LABEL_FILE, "w").close()
 
-# TTS engine
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 180)
-tts_engine.setProperty('volume', 1.0)
+# Track last spoken labels to avoid repeating audio
+last_spoken_labels = ""
 
-# Wake word detection
-WAKE_WORD = "hey vision"
-recognizer = sr.Recognizer()
-mic = sr.Microphone()
+# Language setting for TTS
+current_language = "en"  # 'en' for English, 'hi' for Hindi
+
 
 # ================= HELPER FUNCTIONS =================
-def speak(text):
-    """Speak text using TTS"""
-    tts_engine.say(text)
-    tts_engine.runAndWait()
-
-def get_scene_description():
-    """Get scene description from Gemini API"""
-    stream_url, capture_url = build_urls()
-    if not capture_url:
-        return "ESP32 not set"
-
-    try:
-        resp = requests.get(capture_url, timeout=3)
-        frame_bytes = resp.content
-
-        result = gemini_model.generate_content([
-            "Describe this scene briefly for a visually impaired person:",
-            {"mime_type": "image/jpeg", "data": frame_bytes}
-        ])
-
-        text = result.text.strip()
-        return text
-    except Exception as e:
-        print("Gemini error:", e)
-        return "Error generating description"
-
-def listen_for_wake_word():
-    """Background thread to listen for wake word and trigger description"""
-    with mic as source:
-        recognizer.adjust_for_ambient_noise(source)
-        print("Listening for wake word: 'hey vision'")
-        while True:
-            try:
-                audio = recognizer.listen(source, timeout=1, phrase_time_limit=3)
-                text = recognizer.recognize_google(audio).lower()
-                if WAKE_WORD in text:
-                    print("Wake word detected! Describing scene...")
-                    description = get_scene_description()
-                    speak(description)
-            except sr.WaitTimeoutError:
-                pass
-            except sr.UnknownValueError:
-                pass
-            except Exception as e:
-                print("Speech recognition error:", e)
-
 def build_urls():
     base = STATE["source_base"].rstrip("/")
     if not base.startswith("http"):
         return None, None
     return f"{base}/stream", f"{base}/capture"
+
 
 def mjpeg_frames(stream_url):
     with requests.get(stream_url, stream=True, timeout=5) as r:
@@ -108,24 +63,52 @@ def mjpeg_frames(stream_url):
                 if frame is not None:
                     yield frame
 
+
 def snapshot_frames(capture_url, fps=8):
     delay = 1.0 / fps
-    while True:
+    try:
+        while True:
+            try:
+                resp = requests.get(capture_url, timeout=3)
+                frame = cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    yield frame
+            except:
+                pass
+            time.sleep(delay)
+    except GeneratorExit:
+        pass
+
+
+def speak_text(text):
+    global current_language
+    lang = 'hi' if current_language == 'hi' else 'en'
+    tld = 'co.in' if current_language == 'hi' else 'com'
+    temp_file = f"temp_{uuid.uuid4().hex}.mp3"
+    try:
+        tts = gTTS(text=text, lang=lang, tld=tld, slow=(lang == 'hi'))
+        tts.save(temp_file)
+        pygame.mixer.init()
+        pygame.mixer.music.load(temp_file)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.1)
+        pygame.mixer.music.stop()
+    except Exception as e:
+        print(f"TTS error: {type(e).__name__}: {e}")
+    finally:
         try:
-            resp = requests.get(capture_url, timeout=3)
-            frame = cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_COLOR)
-            if frame is not None:
-                yield frame
+            os.remove(temp_file)
         except:
             pass
-        time.sleep(delay)
+
 
 def generate_mjpeg():
     stream_url, capture_url = build_urls()
     if not stream_url:
-        blank = np.zeros((360, 640, 3), dtype=np.uint8)
-        cv2.putText(blank, "Set ESP32 IP", (30, 180),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        blank = np.zeros((480, 800, 3), dtype=np.uint8)
+        cv2.putText(blank, "Set ESP32 IP", (180, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
         _, buf = cv2.imencode(".jpg", blank)
         while True:
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
@@ -154,28 +137,39 @@ def generate_mjpeg():
                 if detected:
                     with open(LAST_LABEL_FILE, "w") as f:
                         f.write(",".join(detected))
+                    global last_spoken_labels
+                    if ",".join(detected) != last_spoken_labels:
+                        last_spoken_labels = ",".join(detected)
+                        speak_text(f"Detected: {last_spoken_labels}")
             except Exception as e:
                 print("YOLO error:", e)
 
         _, buf = cv2.imencode(".jpg", annotated)
         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
 
+
 # ================= FLASK ROUTES =================
 @app.route("/")
 def index():
     return render_template("index.html")
 
+
 @app.route("/video_feed")
 def video_feed():
     return Response(generate_mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 @app.route("/labels")
 def labels():
     try:
         with open(LAST_LABEL_FILE) as f:
-            return jsonify({"labels": f.read()})
+            labels = f.read()
+            if labels:
+                speak_text(f"Detected objects: {labels}")
+            return jsonify({"labels": labels})
     except:
         return jsonify({"labels": ""})
+
 
 @app.route("/describe", methods=["GET"])
 def describe():
@@ -185,19 +179,33 @@ def describe():
         return jsonify({"text": "ESP32 not set"})
 
     try:
-        resp = requests.get(capture_url, timeout=3)
+        resp = requests.get(capture_url, timeout=5)
         frame_bytes = resp.content
 
+        if not frame_bytes:
+            return jsonify({"text": "No image data received from ESP32"})
+
+        # Language-aware prompt for Gemini
+        lang_prompt = "in Hindi" if current_language == "hi" else "in English"
         result = gemini_model.generate_content([
-            "Describe this scene briefly for a visually impaired person:",
+            f"Describe this scene briefly for a visually impaired person {lang_prompt}:",
             {"mime_type": "image/jpeg", "data": frame_bytes}
         ])
 
-        text = result.text.strip()
-        return jsonify({"text": text})
+        if result and hasattr(result, 'text'):
+            text = result.text.strip()
+            if text:
+                speak_text(text)
+                return jsonify({"text": text})
+            else:
+                return jsonify({"text": "Gemini returned empty response"})
+        else:
+            return jsonify({"text": "Invalid response from Gemini API"})
+
     except Exception as e:
-        print("Gemini error:", e)
-        return jsonify({"text": "Error generating description"})
+        print(f"Gemini error: {type(e).__name__}: {e}")
+        return jsonify({"text": f"Error generating description: {str(e)}"})
+
 
 @app.route("/set_source", methods=["POST"])
 def set_source():
@@ -206,10 +214,56 @@ def set_source():
     STATE["use_stream"] = bool(data.get("use_stream", True))
     return jsonify({"ok": True})
 
+
+@app.route("/set_language", methods=["POST"])
+def set_language():
+    global current_language
+    data = request.get_json()
+    current_language = data.get("language", "en")
+    print(f"Language set to: {current_language}")
+    return jsonify({"ok": True, "language": current_language})
+
+
+@app.route("/start_yolo", methods=["GET"])
+def start_yolo():
+    try:
+        with open(LAST_LABEL_FILE) as f:
+            labels = f.read().strip()
+            if labels:
+                speak_text(f"Detected: {labels}")
+    except:
+        pass
+    return jsonify({"ok": True})
+
+
+@app.route("/read_text", methods=["GET"])
+def read_text():
+    """OCR on latest frame"""
+    stream_url, capture_url = build_urls()
+    if not capture_url:
+        return jsonify({"text": "ESP32 not set"})
+
+    try:
+        resp = requests.get(capture_url, timeout=3)
+        frame = cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({"text": "Failed to decode frame"})
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        text = pytesseract.image_to_string(thresh, config='--psm 6')
+        if text.strip() == "":
+            return jsonify({"text": "No readable text detected."})
+
+        speak_text(text.strip())
+        return jsonify({"text": text.strip()})
+    except Exception as e:
+        print("OCR error:", e)
+        return jsonify({"text": "Error reading text"})
+
+
 # ================= RUN APP =================
 if __name__ == "__main__":
-    # Start wake word listener in background thread
-    wake_thread = threading.Thread(target=listen_for_wake_word, daemon=True)
-    wake_thread.start()
-    print("Wake word thread started.")
     app.run(host="0.0.0.0", port=5000, debug=True)
