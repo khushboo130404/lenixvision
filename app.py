@@ -1,4 +1,4 @@
-from flask import Flask, render_template, Response, jsonify, request
+from flask import Flask, render_template, Response, jsonify, request, send_file
 import cv2
 import numpy as np
 import requests
@@ -6,9 +6,7 @@ import time
 from ultralytics import YOLO
 import google.generativeai as genai
 import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 from gtts import gTTS
-import pygame
 import os
 import uuid
 
@@ -25,7 +23,7 @@ STATE = {
 model = YOLO("yolov8n.pt")
 
 # Gemini Vision API
-GEMINI_API_KEY = "AIzaSyCnXazKr97QhOoBgGSKCDHfq7RtgXiSXak"  # Replace with your valid key
+GEMINI_API_KEY = "AIzaSyCnXazKr97QhOoBgGSKCDHfq7RtgXiSXak"  # Replace with your key
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -81,26 +79,21 @@ def snapshot_frames(capture_url, fps=8):
 
 
 def speak_text(text):
+    """Generate TTS MP3 files instead of playing audio (AWS EC2 compatible)."""
     global current_language
     lang = 'hi' if current_language == 'hi' else 'en'
     tld = 'co.in' if current_language == 'hi' else 'com'
-    temp_file = f"temp_{uuid.uuid4().hex}.mp3"
+
+    file_name = f"speech_{uuid.uuid4().hex}.mp3"
+
     try:
-        tts = gTTS(text=text, lang=lang, tld=tld, slow=(lang == 'hi'))
-        tts.save(temp_file)
-        pygame.mixer.init()
-        pygame.mixer.music.load(temp_file)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
-        pygame.mixer.music.stop()
+        tts = gTTS(text=text, lang=lang, tld=tld)
+        tts.save(file_name)
+        print(f"[TTS] Audio saved: {file_name}")
     except Exception as e:
-        print(f"TTS error: {type(e).__name__}: {e}")
-    finally:
-        try:
-            os.remove(temp_file)
-        except:
-            pass
+        print(f"TTS error: {e}")
+
+    return file_name  # return file path in case you want to send it
 
 
 def generate_mjpeg():
@@ -127,20 +120,25 @@ def generate_mjpeg():
                 results = model(frame, verbose=False)
                 annotated = results[0].plot()
                 det = results[0].boxes
+
                 if det is not None and det.cls is not None:
                     names = results[0].names
                     clss = det.cls.cpu().numpy().astype(int)
                     confs = det.conf.cpu().numpy()
+
                     for c, p in zip(clss, confs):
                         if p > 0.4:
                             detected.append(names.get(c, str(c)))
+
                 if detected:
                     with open(LAST_LABEL_FILE, "w") as f:
                         f.write(",".join(detected))
+
                     global last_spoken_labels
                     if ",".join(detected) != last_spoken_labels:
                         last_spoken_labels = ",".join(detected)
                         speak_text(f"Detected: {last_spoken_labels}")
+
             except Exception as e:
                 print("YOLO error:", e)
 
@@ -185,7 +183,6 @@ def describe():
         if not frame_bytes:
             return jsonify({"text": "No image data received from ESP32"})
 
-        # Language-aware prompt for Gemini
         lang_prompt = "in Hindi" if current_language == "hi" else "in English"
         result = gemini_model.generate_content([
             f"Describe this scene briefly for a visually impaired person {lang_prompt}:",
@@ -203,7 +200,7 @@ def describe():
             return jsonify({"text": "Invalid response from Gemini API"})
 
     except Exception as e:
-        print(f"Gemini error: {type(e).__name__}: {e}")
+        print(f"Gemini error: {e}")
         return jsonify({"text": f"Error generating description: {str(e)}"})
 
 
